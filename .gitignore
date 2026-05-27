@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Model cache — never push weights to GitHub
+~/.cache/huggingface/
+
+# Saved frames
+frame_*.png
+scene.png
+
+# Environment
+.env
+*.log
