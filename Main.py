@@ -5,7 +5,9 @@ import time
 import torch
 from PIL import Image
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-
+import os
+os.environ["MESA_GL_VERSION_OVERRIDE"] = "3.3"  # Force OpenGL 3.3 for better compatibility
+os.environ["MESA_GLSL_VERSION_OVERRIDE"] = "330"  # Match GLSL version to OpenGL
 # ── STEP 1: Load OpenVLA ──────────────────────────────────────────
 print("Loading OpenVLA...")
 
@@ -96,7 +98,216 @@ def get_action(image, instruction):
             do_sample=False
         )
     return action
+def scripted_approach(target_pos, num_steps=300):
+    """
+    Phase 1 — Move arm directly above cube using simple IK.
+    No OpenVLA involved — pure scripted motion.
+    Like a crane positioning itself before the operator takes over.
+    """
+    print("\nPhase 1: Scripted approach — moving arm above cube...")
 
+    # Target is directly above the cube, 15cm up
+    # We go above first so we don't knock it over approaching from the side
+    above_cube = [target_pos[0], target_pos[1], target_pos[2] + 0.15]
+
+    # Orientation — gripper pointing straight down
+    target_orn = p.getQuaternionFromEuler([3.14159, 0, 0])
+
+    for step in range(num_steps):
+        # Calculate IK for above-cube position
+        joint_angles = p.calculateInverseKinematics(
+            robotId,
+            END_EFFECTOR_LINK,
+            above_cube,
+            target_orn
+        )
+
+        # Command all arm joints
+        for i in range(NUM_ARM_JOINTS):
+            p.setJointMotorControl2(
+                bodyIndex=robotId,
+                jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=joint_angles[i],
+                force=100
+            )
+
+        # Keep gripper open during approach
+        for finger_joint in [9, 10]:
+            p.setJointMotorControl2(
+                bodyIndex=robotId,
+                jointIndex=finger_joint,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.04,
+                force=20
+            )
+
+        # Step physics smoothly
+        p.stepSimulation()
+        time.sleep(1/240)
+
+        # Check how close we are every 50 steps
+        if step % 50 == 0:
+            ee_state = p.getLinkState(robotId, END_EFFECTOR_LINK)
+            ee_pos = ee_state[0]
+            dist = np.sqrt(sum((ee_pos[i] - above_cube[i])**2 for i in range(3)))
+            print(f"  Step {step:03d} | EE pos: "
+                  f"X:{ee_pos[0]:.3f} Y:{ee_pos[1]:.3f} Z:{ee_pos[2]:.3f} | "
+                  f"Distance to target: {dist:.4f}m")
+
+            # Close enough — stop early
+            if dist < 0.01:
+                print("  Reached position!")
+                break
+
+    print("Phase 1 complete — arm is above cube\n")
+
+def scripted_descend(target_pos, num_steps=200):
+    """
+    Phase 1.5 — Descend straight down onto the cube.
+    Moves from above the cube to just touching it.
+    Like an elevator going straight down.
+    """
+    print("Phase 1.5: Descending onto cube...")
+
+    # Target is right at cube height
+    at_cube = [target_pos[0], target_pos[1], target_pos[2] + 0.02]
+    target_orn = p.getQuaternionFromEuler([3.14159, 0, 0])
+
+    for step in range(num_steps):
+        joint_angles = p.calculateInverseKinematics(
+            robotId,
+            END_EFFECTOR_LINK,
+            at_cube,
+            target_orn
+        )
+
+        for i in range(NUM_ARM_JOINTS):
+            p.setJointMotorControl2(
+                bodyIndex=robotId,
+                jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=joint_angles[i],
+                force=100
+            )
+
+        # Keep gripper open while descending
+        for finger_joint in [9, 10]:
+            p.setJointMotorControl2(
+                bodyIndex=robotId,
+                jointIndex=finger_joint,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.04,
+                force=20
+            )
+
+        p.stepSimulation()
+        time.sleep(1/240)
+
+        if step % 50 == 0:
+            ee_state = p.getLinkState(robotId, END_EFFECTOR_LINK)
+            ee_pos = ee_state[0]
+            dist = np.sqrt(sum((ee_pos[i] - at_cube[i])**2 for i in range(3)))
+            print(f"  Step {step:03d} | "
+                  f"EE Z:{ee_pos[2]:.3f} | "
+                  f"Distance: {dist:.4f}m")
+            if dist < 0.01:
+                print("  Reached cube!")
+                break
+
+    print("Phase 1.5 complete — arm is at cube\n")
+
+def scripted_place(drop_pos, num_steps=300):
+    """
+    Phase 3 — Carry cube to target position and drop it.
+    Scripted motion — lift up, move to target, descend, release.
+    """
+    print("\nPhase 3: Moving to drop position...")
+
+    target_orn = p.getQuaternionFromEuler([3.14159, 0, 0])
+
+    # Step 1 — lift up first so we don't drag the cube across the table
+    lift_pos = list(drop_pos)
+    lift_pos[2] += 0.2  # lift 20cm above drop target
+
+    print("  Lifting cube...")
+    for step in range(num_steps):
+        joint_angles = p.calculateInverseKinematics(
+            robotId, END_EFFECTOR_LINK, lift_pos, target_orn
+        )
+        for i in range(NUM_ARM_JOINTS):
+            p.setJointMotorControl2(
+                bodyIndex=robotId, jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=joint_angles[i], force=100
+            )
+        # Keep gripper closed — holding the cube
+        for finger_joint in [9, 10]:
+            p.setJointMotorControl2(
+                bodyIndex=robotId, jointIndex=finger_joint,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.0, force=20
+            )
+        p.stepSimulation()
+        time.sleep(1/240)
+
+        if step % 50 == 0:
+            ee_state = p.getLinkState(robotId, END_EFFECTOR_LINK)
+            ee_pos = ee_state[0]
+            dist = np.sqrt(sum((ee_pos[i] - lift_pos[i])**2 for i in range(3)))
+            print(f"  Step {step:03d} | Distance to lift point: {dist:.4f}m")
+            if dist < 0.02:
+                print("  Lifted!")
+                break
+
+    # Step 2 — move horizontally to above drop position
+    print("  Moving to drop position...")
+    for step in range(num_steps):
+        joint_angles = p.calculateInverseKinematics(
+            robotId, END_EFFECTOR_LINK, lift_pos, target_orn
+        )
+        # same as lift_pos but now targeting drop x,y
+        above_drop = [drop_pos[0], drop_pos[1], lift_pos[2]]
+        joint_angles = p.calculateInverseKinematics(
+            robotId, END_EFFECTOR_LINK, above_drop, target_orn
+        )
+        for i in range(NUM_ARM_JOINTS):
+            p.setJointMotorControl2(
+                bodyIndex=robotId, jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=joint_angles[i], force=100
+            )
+        for finger_joint in [9, 10]:
+            p.setJointMotorControl2(
+                bodyIndex=robotId, jointIndex=finger_joint,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.0, force=20
+            )
+        p.stepSimulation()
+        time.sleep(1/240)
+
+        if step % 50 == 0:
+            ee_state = p.getLinkState(robotId, END_EFFECTOR_LINK)
+            ee_pos = ee_state[0]
+            dist = np.sqrt(sum((ee_pos[i] - above_drop[i])**2 for i in range(3)))
+            print(f"  Step {step:03d} | Distance to drop point: {dist:.4f}m")
+            if dist < 0.02:
+                print("  Above drop position!")
+                break
+
+    # Step 3 — open gripper and drop
+    print("  Dropping cube...")
+    for step in range(60):
+        for finger_joint in [9, 10]:
+            p.setJointMotorControl2(
+                bodyIndex=robotId, jointIndex=finger_joint,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.04, force=20
+            )
+        p.stepSimulation()
+        time.sleep(1/240)
+
+    print("Phase 3 complete — cube dropped!\n")
 # ── STEP 5: Apply action to robot ────────────────────────────────
 def apply_action(action):
     """
@@ -164,47 +375,65 @@ def apply_action(action):
             force=20
         )
 
+cube_pos, _ = p.getBasePositionAndOrientation(cubeId)
+cube_pos = list(cube_pos)
+print(f"Cube position: X:{cube_pos[0]:.3f} Y:{cube_pos[1]:.3f} Z:{cube_pos[2]:.3f}")
+
+
+scripted_approach(cube_pos)  # move above the cube before starting
+scripted_descend(cube_pos)   # descend straight down onto the cube
+
+
+
 # ── STEP 6: Main loop ─────────────────────────────────────────────
+# Phase 2 — OpenVLA grasping
 instruction = "pick up the red cube"
-print(f"\nInstruction: '{instruction}'")
-print("Running — press Ctrl+C to stop\n")
+print(f"Phase 2: OpenVLA taking over — '{instruction}'")
+print("Running OpenVLA — will stop once gripper closes...\n")
 
 step = 0
+gripper_closed_steps = 0
+
 try:
     while True:
-        # Get camera image
         image = get_camera_image()
 
-        # Save every 10th frame
         if step % 10 == 0:
             image.save(f"frame_{step:04d}.png")
 
-        # Run OpenVLA
         action = get_action(image, instruction)
-
-        # Apply action to robot arm
         apply_action(action)
 
-        # Print
-        print(f"Step {step:03d} | "
-              f"X:{action[0]:+.3f}  "
-              f"Y:{action[1]:+.3f}  "
-              f"Z:{action[2]:+.3f}  "
-              f"Gripper:{action[6]:+.3f}")
         ee_state = p.getLinkState(robotId, END_EFFECTOR_LINK)
         ee_pos = ee_state[0]
         print(f"Step {step:03d} | "
-            f"Action X:{action[0]:+.3f} Y:{action[1]:+.3f} Z:{action[2]:+.3f} "
-            f"Gripper:{action[6]:+.3f} | "
-            f"EE X:{ee_pos[0]:.3f} Y:{ee_pos[1]:.3f} Z:{ee_pos[2]:.3f}")
+              f"Action X:{action[0]:+.3f} Y:{action[1]:+.3f} Z:{action[2]:+.3f} "
+              f"Gripper:{action[6]:+.3f} | "
+              f"EE X:{ee_pos[0]:.3f} Y:{ee_pos[1]:.3f} Z:{ee_pos[2]:.3f}")
 
-        # Step physics — now the arm actually moves
         for _ in range(48):
             p.stepSimulation()
             time.sleep(1/240)
+
+        # If gripper stays closed for 5 consecutive steps — assume grasp succeeded
+        if action[6] > 0.5:
+            gripper_closed_steps += 1
+        else:
+            gripper_closed_steps = 0
+
+        if gripper_closed_steps >= 5:
+            print("\nGrasp detected! Moving to place phase...")
+            break
 
         step += 1
 
 except KeyboardInterrupt:
     print("\nStopped.")
     p.disconnect()
+
+# Phase 3 — place the cube
+DROP_POSITION = [0.4, -0.2, 0.75]
+scripted_place(DROP_POSITION)
+
+print("\nFull pick and place complete!")
+p.disconnect()
